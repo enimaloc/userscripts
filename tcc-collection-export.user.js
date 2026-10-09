@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TCC – Export de l'album en image
 // @namespace    tcc-collection-export
-// @version      1.0.0
+// @version      1.1.0
 // @description  Ajoute un bouton sur la page collection de TCC (Twitch Collectible Cards) pour exporter toutes les cartes de l'album, rangées par catégorie, dans une seule image.
 // @match        https://tcc.too-pixel.com/*
 // @icon         https://tcc.too-pixel.com/favicon.ico
@@ -85,6 +85,12 @@
   const MAX_SIDE = 16000;
   const MAX_AREA = 100e6;
   const IMAGE_CONCURRENCY = 6;
+
+  // GIF animé : le site change l'effet glitch 10 fois par seconde.
+  const GIF_FRAMES = 12;
+  const GIF_DELAY_CS = 10; // durée d'une image, en centièmes de seconde
+  const GIF_MAX_AREA = 24e6;
+  const GIF_TRANSPARENT = 255; // dernier indice de la palette, réservé à la transparence
 
   // ------------------------------------------------------------------ réglages
 
@@ -570,6 +576,337 @@
     if (canFilter) ctx.filter = 'none';
   }
 
+  // ----------------------------------------------------------------------- GIF
+  //
+  // Encodeur GIF89a minimal, sans dépendance. Un GIF n'a que 256 couleurs : on
+  // calcule une palette commune à toute l'animation (median cut), puis chaque
+  // pixel est ramené à cette palette. Les aplats (fond, bandeaux) ont leur
+  // couleur exacte dans la palette ; ailleurs, un tramage ordonné masque le
+  // manque de couleurs. Ce tramage ne dépend que de la couleur et de la position
+  // du pixel, donc une zone qui ne change pas donne exactement les mêmes indices
+  // d'une image à l'autre : seules les cartes glitched sont réécrites, le reste
+  // de chaque image est transparent.
+
+  const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  const DITHER = (() => {
+    const bayer = [
+      0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26,
+      12, 44, 4, 36, 14, 46, 6, 38, 60, 28, 52, 20, 62, 30, 54, 22,
+      3, 35, 11, 43, 1, 33, 9, 41, 51, 19, 59, 27, 49, 17, 57, 25,
+      15, 47, 7, 39, 13, 45, 5, 37, 63, 31, 55, 23, 61, 29, 53, 21,
+    ];
+    const spread = 24;
+    return Int8Array.from(bayer, (v) => Math.round(((v + 0.5) / 64 - 0.5) * spread));
+  })();
+  // En dessous de cet écart (somme sur R, V, B) avec la couleur de palette, pas de tramage.
+  const DITHER_MIN_ERROR = 12;
+  // Une couleur qui couvre au moins cette part de l'image reçoit sa propre entrée de palette.
+  const FLAT_COLOR_SHARE = 0.004;
+  const FLAT_COLOR_LIMIT = 48;
+
+  class ByteWriter {
+    constructor(size) { this.buffer = new Uint8Array(Math.max(1024, size)); this.length = 0; }
+    reserve(extra) {
+      if (this.length + extra <= this.buffer.length) return;
+      const bigger = new Uint8Array(Math.max(this.buffer.length * 2, this.length + extra));
+      bigger.set(this.buffer.subarray(0, this.length));
+      this.buffer = bigger;
+    }
+    byte(value) { this.reserve(1); this.buffer[this.length++] = value; }
+    u16(value) { this.reserve(2); this.buffer[this.length++] = value & 255; this.buffer[this.length++] = (value >> 8) & 255; }
+    bytes(array, count) { this.reserve(count); this.buffer.set(array.subarray(0, count), this.length); this.length += count; }
+    ascii(text) { for (let i = 0; i < text.length; i++) this.byte(text.charCodeAt(i)); }
+  }
+
+  /** Histogramme RGB 5-5-5 (32 768 cases) : nombre de pixels et somme des couleurs réelles par case. */
+  function createHistogram() {
+    return { counts: new Uint32Array(32768), sums: new Float64Array(32768 * 3) };
+  }
+
+  function addToHistogram(data, histogram) {
+    const { counts, sums } = histogram;
+    for (let p = 0; p < data.length; p += 4) {
+      const cell = ((data[p] >> 3) << 10) | ((data[p + 1] >> 3) << 5) | (data[p + 2] >> 3);
+      counts[cell]++;
+      sums[cell * 3] += data[p];
+      sums[cell * 3 + 1] += data[p + 1];
+      sums[cell * 3 + 2] += data[p + 2];
+    }
+  }
+
+  /** Median cut sur l'histogramme → palette de `maxColors` couleurs au plus (Uint8Array de 256 × 3). */
+  function buildPalette({ counts: histogram, sums }, maxColors) {
+    const channels = [(v) => v >> 10, (v) => (v >> 5) & 31, (v) => v & 31];
+    const makeBox = (bins) => {
+      let count = 0;
+      const min = [31, 31, 31], max = [0, 0, 0];
+      for (const bin of bins) {
+        count += histogram[bin];
+        for (let c = 0; c < 3; c++) {
+          const v = channels[c](bin);
+          if (v < min[c]) min[c] = v;
+          if (v > max[c]) max[c] = v;
+        }
+      }
+      let axis = 0;
+      for (let c = 1; c < 3; c++) if (max[c] - min[c] > max[axis] - min[axis]) axis = c;
+      return { bins, count, axis, range: max[axis] - min[axis] };
+    };
+
+    let used = [];
+    let totalPixels = 0;
+    for (let i = 0; i < histogram.length; i++) if (histogram[i]) { used.push(i); totalPixels += histogram[i]; }
+
+    // Les grands aplats d'abord : une entrée chacun, à leur couleur exacte.
+    const flat = used
+      .filter((bin) => histogram[bin] >= totalPixels * FLAT_COLOR_SHARE)
+      .sort((a, b) => histogram[b] - histogram[a])
+      .slice(0, Math.min(FLAT_COLOR_LIMIT, maxColors - 1));
+    const flatSet = new Set(flat);
+    used = used.filter((bin) => !flatSet.has(bin));
+
+    const boxes = flat.map((bin) => makeBox([bin]));
+    if (used.length) boxes.push(makeBox(used));
+    while (boxes.length < maxColors) {
+      // On coupe la boîte la plus étalée ; la racine évite qu'un grand aplat n'accapare la palette.
+      let best = -1, bestScore = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        const score = boxes[i].bins.length > 1 ? Math.sqrt(boxes[i].count) * boxes[i].range : 0;
+        if (score > bestScore) { bestScore = score; best = i; }
+      }
+      if (best < 0) break;
+      const box = boxes[best];
+      const channel = channels[box.axis];
+      box.bins.sort((a, b) => channel(a) - channel(b));
+      let cut = 0, seen = 0;
+      while (cut < box.bins.length - 1 && seen < box.count / 2) seen += histogram[box.bins[cut++]];
+      cut = Math.max(1, Math.min(box.bins.length - 1, cut));
+      boxes.splice(best, 1, makeBox(box.bins.slice(0, cut)), makeBox(box.bins.slice(cut)));
+    }
+
+    const colors = new Uint8Array(256 * 3);
+    boxes.forEach((box, i) => {
+      const sum = [0, 0, 0];
+      for (const bin of box.bins) for (let c = 0; c < 3; c++) sum[c] += sums[bin * 3 + c];
+      for (let c = 0; c < 3; c++) colors[i * 3 + c] = Math.round(sum[c] / (box.count || 1));
+    });
+    return { colors, count: boxes.length };
+  }
+
+  /** Complète la palette avec sa table RGB 5-5-5 → indice de la couleur la plus proche. */
+  function buildColorLookup(palette) {
+    const { colors, count } = palette;
+    const lookup = new Uint8Array(32768);
+    for (let cell = 0; cell < 32768; cell++) {
+      const r = (cell >> 10) * 8 + 4, g = ((cell >> 5) & 31) * 8 + 4, b = (cell & 31) * 8 + 4;
+      let best = 0, bestDistance = Infinity;
+      for (let i = 0, p = 0; i < count; i++, p += 3) {
+        const dr = r - colors[p], dg = g - colors[p + 1], db = b - colors[p + 2];
+        const distance = dr * dr + dg * dg + db * db;
+        if (distance < bestDistance) { bestDistance = distance; best = i; }
+      }
+      lookup[cell] = best;
+    }
+    palette.lookup = lookup;
+    return palette;
+  }
+
+  /**
+   * Convertit un rectangle RGBA en indices de palette. (originX, originY) est la
+   * position du rectangle dans l'album : le tramage en dépend pour rester stable.
+   */
+  function quantizeRect(data, width, height, originX, originY, palette, out, outOffset, outStride) {
+    const { colors, lookup } = palette;
+    let p = 0;
+    for (let y = 0; y < height; y++) {
+      let o = outOffset + y * outStride;
+      const ditherRow = ((originY + y) & 7) << 3;
+      for (let x = 0; x < width; x++, p += 4, o++) {
+        let r = data[p], g = data[p + 1], b = data[p + 2];
+        let index = lookup[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
+        const q = index * 3;
+        const dr = r - colors[q], dg = g - colors[q + 1], db = b - colors[q + 2];
+        if ((dr < 0 ? -dr : dr) + (dg < 0 ? -dg : dg) + (db < 0 ? -db : db) > DITHER_MIN_ERROR) {
+          const t = DITHER[ditherRow | ((originX + x) & 7)];
+          r += t; g += t; b += t;
+          r = r < 0 ? 0 : r > 255 ? 255 : r;
+          g = g < 0 ? 0 : g > 255 ? 255 : g;
+          b = b < 0 ? 0 : b > 255 ? 255 : b;
+          index = lookup[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
+        }
+        out[o] = index;
+      }
+    }
+  }
+
+  /** Compression LZW du format GIF (codes de 9 à 12 bits, blocs de 255 octets au plus). */
+  function writeLzw(out, pixels, length) {
+    const MIN_CODE_SIZE = 8;
+    const HASH_SIZE = 5003;
+    const MAX_CODES = 4096;
+    const clearCode = 1 << MIN_CODE_SIZE;
+    const endCode = clearCode + 1;
+    const hashKeys = new Int32Array(HASH_SIZE).fill(-1);
+    const hashCodes = new Int32Array(HASH_SIZE);
+    const packet = new Uint8Array(255);
+    let packetLength = 0;
+    let bits = 0, bitCount = 0;
+    let codeSize = MIN_CODE_SIZE + 1;
+    let nextCode = endCode + 1;
+
+    const emit = (code) => {
+      bits |= code << bitCount;
+      bitCount += codeSize;
+      while (bitCount >= 8) {
+        packet[packetLength++] = bits & 255;
+        if (packetLength === 255) { out.byte(255); out.bytes(packet, 255); packetLength = 0; }
+        bits >>>= 8;
+        bitCount -= 8;
+      }
+    };
+
+    out.byte(MIN_CODE_SIZE);
+    emit(clearCode);
+    let prefix = pixels[0];
+    for (let i = 1; i < length; i++) {
+      const pixel = pixels[i];
+      const key = (pixel << 12) | prefix;
+      let slot = (pixel << 4) ^ prefix;
+      let found = false;
+      if (hashKeys[slot] === key) found = true;
+      else if (hashKeys[slot] >= 0) {
+        const step = slot === 0 ? 1 : HASH_SIZE - slot;
+        do {
+          slot -= step;
+          if (slot < 0) slot += HASH_SIZE;
+          if (hashKeys[slot] === key) { found = true; break; }
+        } while (hashKeys[slot] >= 0);
+      }
+      if (found) { prefix = hashCodes[slot]; continue; }
+
+      emit(prefix);
+      prefix = pixel;
+      if (nextCode < MAX_CODES) {
+        // Le décodeur élargit ses codes dès que son dictionnaire atteint 2^taille.
+        if (nextCode === 1 << codeSize) codeSize++;
+        hashKeys[slot] = key;
+        hashCodes[slot] = nextCode++;
+      } else {
+        emit(clearCode);
+        hashKeys.fill(-1);
+        codeSize = MIN_CODE_SIZE + 1;
+        nextCode = endCode + 1;
+      }
+    }
+    emit(prefix);
+    if (nextCode === 1 << codeSize && codeSize < 12) codeSize++;
+    emit(endCode);
+    if (bitCount > 0) { packet[packetLength++] = bits & 255; }
+    if (packetLength > 0) { out.byte(packetLength); out.bytes(packet, packetLength); }
+    out.byte(0);
+  }
+
+  function writeGifFrame(out, pixels, x, y, width, height, transparent) {
+    out.byte(0x21); out.byte(0xf9); out.byte(4);
+    out.byte(0x04 | (transparent ? 1 : 0)); // on garde l'image précédente dessous
+    out.u16(GIF_DELAY_CS);
+    out.byte(transparent ? GIF_TRANSPARENT : 0);
+    out.byte(0);
+    out.byte(0x2c); out.u16(x); out.u16(y); out.u16(width); out.u16(height); out.byte(0);
+    writeLzw(out, pixels, width * height);
+  }
+
+  /**
+   * Encode l'album en GIF animé. `canvas` contient l'album avec les cartes
+   * glitched dessinées « propres » ; `cards` liste ces cartes ({x, y, seed, bitmap}).
+   */
+  async function encodeAnimatedGif(canvas, ctx, cards, cardWidth, cardHeight, pad, hooks) {
+    const W = canvas.width, H = canvas.height;
+    const STRIP = 256;
+
+    const regions = cards.map((card) => {
+      const left = Math.max(0, card.x - pad);
+      const right = Math.min(W, card.x + cardWidth + pad);
+      return { card, x: left, y: card.y, w: right - left, h: Math.min(cardHeight, H - card.y) };
+    });
+    const work = document.createElement('canvas');
+    work.width = Math.max.apply(null, regions.map((r) => r.w));
+    work.height = cardHeight;
+    const workCtx = work.getContext('2d', { willReadFrequently: true });
+
+    const renderRegion = (region, frame) => {
+      workCtx.clearRect(0, 0, work.width, work.height);
+      workCtx.drawImage(canvas, region.x, region.y, region.w, region.h, 0, 0, region.w, region.h);
+      drawGlitchSlices(workCtx, region.card.bitmap, region.card.x - region.x, 0, cardWidth, cardHeight, region.card.seed + '|' + frame);
+      return workCtx.getImageData(0, 0, region.w, region.h).data;
+    };
+
+    // 1) Palette commune : l'album entier + toutes les images de l'effet glitch.
+    hooks.status('GIF : calcul de la palette…');
+    await nextTick();
+    const histogram = createHistogram();
+    for (let y = 0; y < H; y += STRIP) addToHistogram(ctx.getImageData(0, y, W, Math.min(STRIP, H - y)).data, histogram);
+    for (let frame = 0; frame < GIF_FRAMES; frame++) {
+      for (const region of regions) addToHistogram(renderRegion(region, frame), histogram);
+    }
+    await nextTick();
+    if (hooks.cancelled()) return null;
+    const palette = buildColorLookup(buildPalette(histogram, GIF_TRANSPARENT));
+
+    const out = new ByteWriter(Math.round(W * H * 0.6));
+    out.ascii('GIF89a');
+    out.u16(W); out.u16(H);
+    out.byte(0xf7); out.byte(0); out.byte(0); // palette globale de 256 couleurs
+    out.bytes(palette.colors, 768);
+    out.byte(0x21); out.byte(0xff); out.byte(11); out.ascii('NETSCAPE2.0');
+    out.byte(3); out.byte(1); out.u16(0); out.byte(0); // boucle infinie
+
+    // 2) Première image : l'album complet.
+    const screen = new Uint8Array(W * H);
+    for (let y = 0; y < H; y += STRIP) {
+      const rows = Math.min(STRIP, H - y);
+      quantizeRect(ctx.getImageData(0, y, W, rows).data, W, rows, 0, y, palette, screen, y * W, W);
+    }
+    for (const region of regions) {
+      quantizeRect(renderRegion(region, 0), region.w, region.h, region.x, region.y, palette, screen, region.y * W + region.x, W);
+    }
+    hooks.progress(1, GIF_FRAMES);
+    hooks.status('GIF : image 1 / ' + GIF_FRAMES);
+    await nextTick();
+    writeGifFrame(out, screen, 0, 0, W, H, false);
+
+    // 3) Images suivantes : seulement les pixels qui changent, dans le cadre englobant des cartes animées.
+    const boxX = Math.min.apply(null, regions.map((r) => r.x));
+    const boxY = Math.min.apply(null, regions.map((r) => r.y));
+    const boxW = Math.max.apply(null, regions.map((r) => r.x + r.w)) - boxX;
+    const boxH = Math.max.apply(null, regions.map((r) => r.y + r.h)) - boxY;
+    const frameBuffer = new Uint8Array(boxW * boxH);
+    const regionBuffer = new Uint8Array(work.width * work.height);
+    for (let frame = 1; frame < GIF_FRAMES; frame++) {
+      if (hooks.cancelled()) return null;
+      frameBuffer.fill(GIF_TRANSPARENT);
+      for (const region of regions) {
+        quantizeRect(renderRegion(region, frame), region.w, region.h, region.x, region.y, palette, regionBuffer, 0, region.w);
+        for (let y = 0; y < region.h; y++) {
+          let s = (region.y + y) * W + region.x;
+          let f = (region.y + y - boxY) * boxW + region.x - boxX;
+          let r = y * region.w;
+          for (let x = 0; x < region.w; x++, s++, f++, r++) {
+            const index = regionBuffer[r];
+            if (screen[s] !== index) { screen[s] = index; frameBuffer[f] = index; }
+          }
+        }
+      }
+      writeGifFrame(out, frameBuffer, boxX, boxY, boxW, boxH, true);
+      hooks.progress(frame + 1, GIF_FRAMES);
+      hooks.status('GIF : image ' + (frame + 1) + ' / ' + GIF_FRAMES);
+      await nextTick();
+    }
+    out.byte(0x3b);
+    return new Blob([out.buffer.subarray(0, out.length)], { type: 'image/gif' });
+  }
+
   // -------------------------------------------------------------- dessin album
 
   function computeLayout(sections, opts, cardWidth) {
@@ -595,10 +932,10 @@
     return { cols, cw, ch, gap, label, titleFont, titleHeight, headerHeight, width, height: y, boxes };
   }
 
-  function fitLayout(sections, opts) {
+  function fitLayout(sections, opts, maxArea) {
     let cardWidth = opts.cardWidth;
     let layout = computeLayout(sections, opts, cardWidth);
-    while ((layout.width > MAX_SIDE || layout.height > MAX_SIDE || layout.width * layout.height > MAX_AREA) && cardWidth > 24) {
+    while ((layout.width > MAX_SIDE || layout.height > MAX_SIDE || layout.width * layout.height > maxArea) && cardWidth > 24) {
       cardWidth = Math.max(24, Math.floor(cardWidth * 0.9));
       layout = computeLayout(sections, opts, cardWidth);
     }
@@ -614,7 +951,11 @@
     await Promise.all(runners);
   }
 
-  async function renderAlbum(data, opts, onProgress, isCancelled) {
+  /** hooks = { progress(fait, total), status(texte), cancelled() } */
+  async function renderAlbum(data, opts, hooks) {
+    const onProgress = hooks.progress;
+    const isCancelled = hooks.cancelled;
+    const animated = opts.format === 'gif';
     const { sections, stats } = buildSections(data, opts);
     if (!sections.length) throw new Error('Aucune carte à exporter avec ces réglages.');
 
@@ -626,12 +967,13 @@
     }
 
     const theme = THEMES[opts.theme] || THEMES.dark;
-    const L = fitLayout(sections, opts);
+    const L = fitLayout(sections, opts, animated ? GIF_MAX_AREA : MAX_AREA);
 
     const canvas = document.createElement('canvas');
     canvas.width = L.width;
     canvas.height = L.height;
-    const ctx = canvas.getContext('2d');
+    // Le GIF relit beaucoup de pixels : un canvas en mémoire centrale est alors bien plus rapide.
+    const ctx = canvas.getContext('2d', animated ? { willReadFrequently: true } : undefined);
     if (!ctx) throw new Error('Image trop grande pour ce navigateur : réduis la largeur des cartes.');
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
@@ -741,7 +1083,12 @@
       drawCard(g, item, img, env);
       ctx.drawImage(cardCanvas, x, y);
       if (item.special === 'glitched' && !usesAltImage(item)) {
-        drawGlitchSlices(ctx, cardCanvas, x, y, L.cw, L.ch, item.bean.card_id + '|' + item.bean.reference);
+        // L'effet est appliqué à la fin : le GIF a besoin de l'album sans glitch et de la carte seule.
+        const bitmap = document.createElement('canvas');
+        bitmap.width = L.cw;
+        bitmap.height = L.ch;
+        bitmap.getContext('2d').drawImage(cardCanvas, 0, 0);
+        glitchCards.push({ x, y, bitmap, seed: item.bean.card_id + '|' + item.bean.reference });
       }
       if (opts.counts && item.count > 1) {
         ctx.fillStyle = placement.text;
@@ -755,6 +1102,7 @@
     const total = direct.length + Array.from(byUrl.values()).reduce((n, list) => n + list.length, 0);
     let done = 0;
     let failed = 0;
+    const glitchCards = [];
 
     for (const placement of direct) { paint(placement, null); done++; }
     onProgress(done, total);
@@ -772,11 +1120,29 @@
     releaseImage(env.subBack);
     if (isCancelled()) return null;
 
-    const mime = opts.format === 'jpeg' ? 'image/jpeg' : 'image/png';
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, mime, 0.92));
-    if (!blob) throw new Error("Le navigateur n'a pas pu encoder l'image (trop grande ?). Réduis la largeur des cartes.");
+    let blob = null;
+    let mime = opts.format === 'jpeg' ? 'image/jpeg' : 'image/png';
+    let frames = 0;
+    if (animated && glitchCards.length) {
+      const pad = Math.max(1, Math.min(Math.ceil(L.cw * 0.05) + 1, Math.floor(L.gap / 2)));
+      blob = await encodeAnimatedGif(canvas, ctx, glitchCards, L.cw, L.ch, pad, hooks);
+      if (!blob) return null;
+      mime = 'image/gif';
+      frames = GIF_FRAMES;
+    }
 
-    return { canvas, blob, mime, width: L.width, height: L.height, cardWidth: L.cw, shrunk: L.shrunk, failed, stats, cards: total };
+    // Version fixe de l'effet glitch : c'est l'image PNG/JPEG, et celle que « Copier » envoie pour un GIF.
+    for (const card of glitchCards) drawGlitchSlices(ctx, card.bitmap, card.x, card.y, L.cw, L.ch, card.seed);
+
+    if (!blob) {
+      blob = await new Promise((resolve) => canvas.toBlob(resolve, mime, 0.92));
+      if (!blob) throw new Error("Le navigateur n'a pas pu encoder l'image (trop grande ?). Réduis la largeur des cartes.");
+    }
+
+    return {
+      canvas, blob, mime, frames, width: L.width, height: L.height, cardWidth: L.cw, shrunk: L.shrunk, failed, stats, cards: total,
+      nothingToAnimate: animated && !frames,
+    };
   }
 
   // ----------------------------------------------------------------- interface
@@ -892,7 +1258,7 @@
         number('columns', 'Cartes par ligne', 2, 80, 1),
         number('cardWidth', "Largeur d'une carte (px)", 30, 750, 10),
         select('theme', 'Thème', [['dark', 'Sombre'], ['light', 'Clair (couleurs du site)']]),
-        select('format', 'Format', [['png', 'PNG'], ['jpeg', 'JPEG (plus léger)']]),
+        select('format', 'Format', [['png', 'PNG'], ['jpeg', 'JPEG (plus léger)'], ['gif', 'GIF animé (cartes glitched)']]),
       ]),
       h('fieldset', { class: 'group' }, [
         h('legend', { text: 'Détails' }),
@@ -964,7 +1330,8 @@
     function fileName() {
       const date = new Date().toISOString().slice(0, 10);
       const clean = (s) => String(s).replace(/[^a-z0-9_-]+/gi, '_');
-      return 'tcc-album-' + clean(result.streamer) + '-' + clean(result.user) + '-' + date + (result.mime === 'image/jpeg' ? '.jpg' : '.png');
+      const extension = { 'image/jpeg': '.jpg', 'image/gif': '.gif' }[result.mime] || '.png';
+      return 'tcc-album-' + clean(result.streamer) + '-' + clean(result.user) + '-' + date + extension;
     }
 
     function downloadResult() {
@@ -978,15 +1345,17 @@
     async function copyResult() {
       if (!result) return;
       try {
-        // Le presse-papiers n'accepte que le PNG.
+        // Le presse-papiers n'accepte que le PNG : pour un GIF ou un JPEG, on copie l'image fixe.
         const png = result.mime === 'image/png' ? result.blob : await new Promise((resolve) => result.canvas.toBlob(resolve, 'image/png'));
         await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
         copyButton.textContent = 'Copié ✓';
       } catch (e) {
         copyButton.textContent = 'Copie impossible';
       }
-      setTimeout(() => { copyButton.textContent = 'Copier'; }, 2500);
+      setTimeout(() => { copyButton.textContent = copyLabel(); }, 2500);
     }
+
+    const copyLabel = () => (result && result.mime === 'image/gif' ? 'Copier (image fixe)' : 'Copier');
 
     function closePreview() {
       overlay.hidden = true;
@@ -1002,9 +1371,12 @@
       previewImage.src = previewUrl;
       const megabytes = (result.blob.size / 1048576).toFixed(1).replace('.', ',');
       let info = result.width + ' × ' + result.height + ' px · ' + megabytes + ' Mo · ' + result.cards + ' cartes';
+      if (result.frames) info += ' · GIF animé, ' + result.frames + ' images, 256 couleurs';
+      if (result.nothingToAnimate) info += ' · aucune carte glitched à animer : export en PNG';
       if (result.shrunk) info += ' · cartes réduites à ' + result.cardWidth + ' px pour tenir dans une image';
       if (result.failed) info += ' · ' + result.failed + ' image(s) non chargée(s)';
       previewInfo.textContent = info;
+      copyButton.textContent = copyLabel();
       overlay.hidden = false;
     }
 
@@ -1026,11 +1398,16 @@
       try {
         const data = await loadAlbumData(route, opts);
         if (cancelled) return;
-        const rendered = await renderAlbum(data, opts, (done, total) => {
-          progress.max = total;
-          progress.value = done;
-          setStatus('Dessin des cartes : ' + done + ' / ' + total);
-        }, () => cancelled);
+        let drawing = true;
+        const rendered = await renderAlbum(data, opts, {
+          progress: (done, total) => {
+            progress.max = total;
+            progress.value = done;
+            if (drawing) setStatus('Dessin des cartes : ' + done + ' / ' + total);
+          },
+          status: (text) => { drawing = false; setStatus(text); },
+          cancelled: () => cancelled,
+        });
         if (!rendered || cancelled) return;
         if (result) closePreview();
         result = Object.assign(rendered, { user: data.user, streamer: data.streamer });

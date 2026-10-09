@@ -22,6 +22,7 @@ Sur `https://tcc.too-pixel.com/collection/<streamer>`, un bouton « 📸 Exporte
 - Cartes créateur regroupées par catégorie, cartes générées et cartes followers en option.
 - Cartes manquantes affichées par leur référence, variantes glitched et quantités de doublons.
 - Nombre de cartes par ligne, largeur des cartes, thème sombre ou clair, PNG ou JPEG.
+- Format « GIF animé » : l'album entier, avec les cartes glitched qui s'animent comme sur le site (12 images, 256 couleurs, donc un rendu moins fin que le PNG).
 
 La page du site n'affiche que les lignes visibles à l'écran, donc le script relit l'album par l'API de TCC avec la session en cours et le redessine en entier. Rien n'est envoyé ailleurs.
 
