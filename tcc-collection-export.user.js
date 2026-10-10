@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TCC – Export de l'album en image
 // @namespace    tcc-collection-export
-// @version      1.1.0
+// @version      1.1.1
 // @description  Ajoute un bouton sur la page collection de TCC (Twitch Collectible Cards) pour exporter toutes les cartes de l'album, rangées par catégorie, dans une seule image.
 // @match        https://tcc.too-pixel.com/*
 // @icon         https://tcc.too-pixel.com/favicon.ico
@@ -119,10 +119,20 @@
     typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest
       : (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function' ? GM.xmlHttpRequest.bind(GM) : null);
 
+  /** Le serveur a répondu, mais par une erreur (404, 403, 500…). */
   class HttpError extends Error {
     constructor(status, url) {
       super('HTTP ' + status + ' sur ' + url);
       this.status = status;
+      this.short = 'HTTP ' + status;
+    }
+  }
+
+  /** Le serveur n'a pas pu être joint du tout (domaine refusé, réseau coupé…). */
+  class NetworkError extends Error {
+    constructor(message, short) {
+      super(message);
+      this.short = short;
     }
   }
 
@@ -132,7 +142,7 @@
       return fetch(url, { headers }).then((r) => {
         if (!r.ok) throw new HttpError(r.status, url);
         return responseType === 'blob' ? r.blob() : r.json();
-      });
+      }, () => { throw new NetworkError('Requête impossible (réseau ou CORS) : ' + url, 'serveur injoignable'); });
     }
     return new Promise((resolve, reject) => {
       gmXhr({
@@ -146,8 +156,8 @@
           if (responseType === 'blob') return resolve(r.response);
           try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(new Error('Réponse illisible pour ' + url)); }
         },
-        onerror: () => reject(new Error('Requête impossible : ' + url)),
-        ontimeout: () => reject(new Error('Délai dépassé : ' + url)),
+        onerror: () => reject(new NetworkError('Requête impossible : ' + url, 'serveur injoignable')),
+        ontimeout: () => reject(Object.assign(new Error('Délai dépassé : ' + url), { short: 'délai dépassé' })),
       });
     });
   }
@@ -290,12 +300,27 @@
 
   // -------------------------------------------------------------------- images
 
-  function imageUrlFor(item) {
+  /**
+   * Image à charger pour une carte : { url, fallback }.
+   *
+   * Les avatars des followers arrivent en 300 × 300. Le site demande toujours la
+   * variante 600 × 600 en réécrivant l'URL ; ici on ne le fait que si la carte
+   * est dessinée assez grande pour en profiter, et l'URL d'origine reste en
+   * secours au cas où la variante n'existerait pas.
+   */
+  function imageSourceFor(item, cardWidth) {
     const bean = item.bean;
-    if (item.locked) return null;
-    if (item.type === 'follower') return bean.img_url ? bean.img_url.replace('300x300', '600x600') : null;
-    if (usesAltImage(item)) return bean.special_img_url;
-    return bean.img_url || null;
+    if (item.locked) return { url: null, fallback: null };
+    if (item.type === 'follower') {
+      const original = bean.img_url || null;
+      const drawnSize = (cardWidth * (CARD_W - 2 * CARD_PAD)) / CARD_W;
+      if (original && drawnSize > 300 && original.includes('300x300')) {
+        return { url: original.replace('300x300', '600x600'), fallback: original };
+      }
+      return { url: original, fallback: null };
+    }
+    if (usesAltImage(item)) return { url: item.bean.special_img_url, fallback: null };
+    return { url: bean.img_url || null, fallback: null };
   }
 
   const usesAltImage = (item) => item.type === 'creator' && item.special === 'glitched' && !!item.bean.special_img_url;
@@ -305,7 +330,11 @@
       const url = URL.createObjectURL(blob);
       const img = new Image();
       img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
-      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image illisible')); };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        const kind = blob.type || 'type inconnu';
+        reject(Object.assign(new Error('Réponse reçue mais ce n\'est pas une image lisible (' + kind + ')'), { short: 'image illisible' }));
+      };
       img.src = url;
     });
   }
@@ -314,18 +343,34 @@
    * Charge une image sous forme de blob (donc « même origine ») pour que le
    * canvas reste exportable même si le serveur d'images n'envoie pas d'en-têtes CORS.
    */
+  async function fetchImageBlob(abs) {
+    if (/^(data|blob):/.test(abs)) return (await fetch(abs)).blob();
+    try {
+      return await request(abs, { responseType: 'blob' });
+    } catch (error) {
+      // Une réponse HTTP en erreur ou un délai dépassé seraient identiques par un autre canal : on s'arrête là.
+      // Seul cas où réessayer a un sens : le gestionnaire de scripts n'a pas pu joindre le serveur
+      // (domaine refusé à l'invite @connect, par exemple).
+      if (!(error instanceof NetworkError) || !gmXhr) throw error;
+      let response;
+      try {
+        response = await fetch(abs, { mode: 'cors', credentials: 'omit' });
+      } catch (e) {
+        // fetch() est soumis au CORS : sans en-têtes adaptés côté serveur, ce repli ne peut pas aboutir.
+        throw new NetworkError(
+          error.message + " — le gestionnaire de scripts n'a pas pu joindre ce serveur et l'accès direct a échoué aussi (réseau ou CORS). "
+            + "Si Tampermonkey a demandé une autorisation pour ce domaine, accepte-la.",
+          'serveur injoignable',
+        );
+      }
+      if (!response.ok) throw new HttpError(response.status, abs);
+      return response.blob();
+    }
+  }
+
   async function loadImage(url) {
     const abs = new URL(url, SITE + '/').href;
-    let blob;
-    if (/^(data|blob):/.test(abs)) {
-      blob = await (await fetch(abs)).blob();
-    } else {
-      try {
-        blob = await request(abs, { responseType: 'blob' });
-      } catch (e) {
-        blob = await (await fetch(abs, { mode: 'cors' })).blob();
-      }
-    }
+    const blob = await fetchImageBlob(abs);
     if (typeof createImageBitmap === 'function') {
       try { return await createImageBitmap(blob); } catch (e) { /* format non géré : on tente <img> */ }
     }
@@ -451,6 +496,31 @@
     g.fill();
   }
 
+  /** Emplacement d'une illustration qui n'a pas pu être chargée : hachures et mention explicite. */
+  function drawMissingImage(g, x, y, w, h) {
+    g.save();
+    g.beginPath();
+    g.rect(x, y, w, h);
+    g.clip();
+    g.fillStyle = '#2b2b2b';
+    g.fillRect(x, y, w, h);
+    g.strokeStyle = '#4a4a4a';
+    g.lineWidth = 22;
+    for (let d = -h; d < w; d += 70) {
+      g.beginPath();
+      g.moveTo(x + d, y + h);
+      g.lineTo(x + d + h, y);
+      g.stroke();
+    }
+    g.fillStyle = '#f1c40f';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.font = '64px ' + TITLE_FONT;
+    g.fillText('IMAGE', x + w / 2, y + h * 0.42 - 36, w - 60);
+    g.fillText('INDISPONIBLE', x + w / 2, y + h * 0.42 + 36, w - 60);
+    g.restore();
+  }
+
   function followTimeText(followDate) {
     const d = new Date(followDate);
     if (isNaN(d)) return '';
@@ -492,7 +562,7 @@
       }
       const size = CARD_W - 2 * CARD_PAD;
       if (img) drawCover(g, img, CARD_PAD, CARD_PAD, size, size);
-      else { g.fillStyle = '#555'; g.fillRect(CARD_PAD, CARD_PAD, size, size); }
+      else drawMissingImage(g, CARD_PAD, CARD_PAD, size, size);
 
       const rectTop = size + 2 * CARD_PAD;
       const rectHeight = CARD_H - rectTop - CARD_PAD - 15;
@@ -512,7 +582,7 @@
       g.fillText(String(bean.reference || ''), CARD_W - CARD_PAD - (CARD_PAD + 5), rectTop + rectHeight - RECT_PAD);
     } else {
       if (img) drawCover(g, img, 0, 0, CARD_W, CARD_H);
-      else { g.fillStyle = '#555'; g.fillRect(0, 0, CARD_W, CARD_H); }
+      else drawMissingImage(g, 0, 0, CARD_W, CARD_H);
 
       g.font = '50px ' + TITLE_FONT;
       const lines = wrapText(g, bean.name, CARD_W - 2 * CARD_PAD - 2 * RECT_PAD);
@@ -1055,6 +1125,7 @@
     // Placements regroupés par image pour ne télécharger chaque fichier qu'une fois.
     const direct = [];
     const byUrl = new Map();
+    const fallbackFor = new Map();
     let needsSubBack = false;
     sections.forEach((section, si) => {
       section.items.forEach((item, index) => {
@@ -1065,15 +1136,19 @@
           y: L.boxes[si].cardsTop + Math.floor(index / L.cols) * (L.ch + L.label + L.gap),
         };
         if (item.type === 'follower' && item.bean.is_sub && !item.locked) needsSubBack = true;
-        const url = imageUrlFor(item);
+        const { url, fallback } = imageSourceFor(item, L.cw);
         if (!url) direct.push(placement);
         else if (byUrl.has(url)) byUrl.get(url).push(placement);
         else byUrl.set(url, [placement]);
+        if (url && fallback) fallbackFor.set(url, fallback);
       });
     });
 
     if (needsSubBack) {
-      env.subBack = await loadImage(SITE + '/assets/images/sub-card-back.png').catch(() => null);
+      env.subBack = await loadImage(SITE + '/assets/images/sub-card-back.png').catch((error) => {
+        console.warn('[TCC export] fond des cartes abonnés non chargé : ' + error.message);
+        return null;
+      });
     }
 
     function paint(placement, img) {
@@ -1101,7 +1176,7 @@
 
     const total = direct.length + Array.from(byUrl.values()).reduce((n, list) => n + list.length, 0);
     let done = 0;
-    let failed = 0;
+    const failures = []; // { url, cards, reason, error }
     const glitchCards = [];
 
     for (const placement of direct) { paint(placement, null); done++; }
@@ -1110,8 +1185,21 @@
     await runPool(Array.from(byUrl.entries()), IMAGE_CONCURRENCY, async ([url, placements]) => {
       if (isCancelled()) return;
       let img = null;
-      try { img = await loadImage(url); } catch (e) { failed += placements.length; }
+      try {
+        img = await loadImage(url);
+      } catch (error) {
+        let failure = error;
+        if (fallbackFor.has(url)) {
+          try { img = await loadImage(fallbackFor.get(url)); failure = null; } catch (second) { failure = second; }
+        }
+        if (failure) {
+          const names = placements.map((p) => p.item.bean.reference || p.item.bean.name).join(', ');
+          failures.push({ url, cards: placements.length, reason: failure.short || failure.message, error: failure });
+          console.warn('[TCC export] image non chargée pour ' + names + ' : ' + failure.message);
+        }
+      }
       if (isCancelled()) { releaseImage(img); return; }
+      // Sans image, la carte est quand même dessinée (elle est possédée), avec un repère « image indisponible ».
       for (const placement of placements) paint(placement, img);
       releaseImage(img);
       done += placements.length;
@@ -1140,7 +1228,7 @@
     }
 
     return {
-      canvas, blob, mime, frames, width: L.width, height: L.height, cardWidth: L.cw, shrunk: L.shrunk, failed, stats, cards: total,
+      canvas, blob, mime, frames, width: L.width, height: L.height, cardWidth: L.cw, shrunk: L.shrunk, failures, stats, cards: total,
       nothingToAnimate: animated && !frames,
     };
   }
@@ -1374,7 +1462,11 @@
       if (result.frames) info += ' · GIF animé, ' + result.frames + ' images, 256 couleurs';
       if (result.nothingToAnimate) info += ' · aucune carte glitched à animer : export en PNG';
       if (result.shrunk) info += ' · cartes réduites à ' + result.cardWidth + ' px pour tenir dans une image';
-      if (result.failed) info += ' · ' + result.failed + ' image(s) non chargée(s)';
+      if (result.failures.length) {
+        const cards = result.failures.reduce((n, f) => n + f.cards, 0);
+        const reasons = Array.from(new Set(result.failures.map((f) => f.reason))).slice(0, 3).join(', ');
+        info += ' · ' + cards + ' carte(s) sans image (' + reasons + ') : détail dans la console';
+      }
       previewInfo.textContent = info;
       copyButton.textContent = copyLabel();
       overlay.hidden = false;
